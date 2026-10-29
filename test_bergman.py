@@ -45,6 +45,53 @@ class Tests(unittest.TestCase):
             count += 1
         self.assertEqual(count, 166)  # Dedekind number M(4) minus the two constant cases
 
+    def test_filter_sequence_all_filters_and_subdivisions(self):
+        E = tuple(range(4))
+        proper = [s for s in _subsets(E) if s and len(s) < len(E)]
+        for candidate in _subsets(proper):
+            try:
+                b = BergmanFilter(E, candidate, basepoint=2)
+            except ValueError:
+                continue
+            sequence = b.filter_sequence()
+            steps = b.subdivision_sequence()
+            self.assertEqual(sequence[0], frozenset())
+            self.assertEqual(sequence[-1], b.order_filter)
+            self.assertEqual(len(sequence), len(b.order_filter) + 1)
+            self.assertEqual([x.order_filter for x in steps], list(sequence))
+            self.assertTrue(all(x.basepoint == 2 for x in steps))
+            for i, (old, new) in enumerate(zip(sequence, sequence[1:])):
+                self.assertTrue(old < new)
+                z, = new - old
+                self.assertFalse(any(z < other for other in b.order_filter - old))
+                # Independently check each intermediate stage is a filter.
+                for x in new:
+                    self.assertTrue(all(not (x <= y) or y in new for y in proper))
+                # Independently apply the stellar subdivision to maximal cones.
+                before = {frozenset(c) for c in steps[i].maximal_cones()}
+                after = {frozenset(c) for c in steps[i+1].maximal_cones()}
+                if len(z) == 1:
+                    self.assertEqual(before, after)
+                else:
+                    centre = frozenset(frozenset([x]) for x in z)
+                    self.assertTrue(any(centre <= c for c in before))
+                    expected = set()
+                    for cone in before:
+                        if centre <= cone:
+                            expected.update((cone - {v}) | {z} for v in centre)
+                        else:
+                            expected.add(cone)
+                    self.assertEqual(after, expected)
+
+    def test_sequence_empty_filter(self):
+        b = BergmanFilter(['a'])
+        self.assertEqual(b.filter_sequence(), (frozenset(),))
+        self.assertEqual(len(b.subdivision_sequence()), 1)
+        with self.assertRaises(ValueError):
+            b.plot_progression(columns=0)
+        with self.assertRaises(ValueError):
+            BergmanFilter(range(5)).plot_progression()
+
     def test_invalid_and_generators(self):
         with self.assertRaises(ValueError):
             BergmanFilter([0, 1, 2, 3], [{0, 1}])
@@ -87,7 +134,7 @@ class Tests(unittest.TestCase):
                 return out
         sage = types.ModuleType("sage")
         all_ = types.ModuleType("sage.all")
-        for name in ("Graphics", "line", "point", "polygon", "text", "line3d",
+        for name in ("Graphics", "arrow", "line", "point", "polygon", "text", "arrow3d", "line3d",
                      "point3d", "polygon3d", "text3d"):
             setattr(all_, name, lambda *a, _name=name, **kw: Graphic(_name, *a, **kw))
         with patch.dict(sys.modules, {"sage": sage, "sage.all": all_}):
@@ -99,6 +146,14 @@ class Tests(unittest.TestCase):
             three = BergmanFilter(range(4)).plot_complex(labels=False)
             self.assertIn("polygon3d", three.names)
             self.assertNotIn("text3d", three.names)
+            fan3 = BergmanFilter(range(4)).plot_fan(labels=False)
+            self.assertIn("arrow3d", fan3.names)
+            self.assertNotIn("line3d", fan3.names)
+            self.assertIn("polygon3d", fan3.names)
+            fan2 = BergmanFilter(range(3)).plot_fan(labels=False)
+            self.assertIn("arrow", fan2.names)
+            self.assertIn("polygon", fan2.names)
+            self.assertNotIn("line", fan2.names)
             with self.assertRaises(ValueError):
                 BergmanFilter([0, 1]).plot(opacity=2)
 
@@ -119,6 +174,20 @@ class Tests(unittest.TestCase):
             obj = BergmanFilter(range(n))
             self.assertIsNotNone(obj.plot_fan())
             self.assertIsNotNone(obj.plot_complex())
+        # Force rendering, not just creation: catches invalid plotting options.
+        import tempfile, os
+        b2 = BergmanFilter(range(3), [{0}, {1}, {2}], generators=True)
+        self.assertEqual(len(b2.fan_sequence()), len(b2.filter_sequence()))
+        self.assertEqual(len(b2.complex_sequence()), len(b2.filter_sequence()))
+        self.assertIsNotNone(b2.plot_progression(columns=3))
+        self.assertIsNotNone(b.plot_progression(columns=2, labels=False))
+        with tempfile.TemporaryDirectory() as tmp:
+            figure = os.path.join(tmp, 'progression.png')
+            b2.plot_progression(columns=3).save(figure, figsize=[12, 12])
+            self.assertGreater(os.path.getsize(figure), 0)
+            filename = os.path.join(tmp, 'fan.png')
+            BergmanFilter(range(3)).plot_fan().save(filename)
+            self.assertGreater(os.path.getsize(filename), 0)
 
 if __name__ == '__main__':
     unittest.main()

@@ -16,6 +16,30 @@ def _subsets(items):
             yield frozenset(choice)
 
 
+def _clip_cone_2d(a, b, bound):
+    """Clip cone(a,b) to a square, returning a polygon without drawn edges."""
+    def cross(u, v):
+        return u[0]*v[1] - u[1]*v[0]
+    if cross(a, b) < 0:
+        a, b = b, a
+    polygon = [(-bound, -bound), (bound, -bound),
+               (bound, bound), (-bound, bound)]
+    for evaluate in (lambda p: cross(a, p), lambda p: cross(p, b)):
+        clipped = []
+        for start, end in zip(polygon, polygon[1:] + polygon[:1]):
+            fs, fe = evaluate(start), evaluate(end)
+            inside_s, inside_e = fs >= -1e-12, fe >= -1e-12
+            if inside_s != inside_e:
+                t = fs / (fs - fe)
+                clipped.append(tuple(start[i] + t*(end[i]-start[i]) for i in (0, 1)))
+            if inside_e:
+                clipped.append(end)
+        polygon = clipped
+        if not polygon:
+            break
+    return polygon
+
+
 class BergmanFilter:
     r"""The Chapter 2 Bergman fan and complex of an order filter.
 
@@ -79,6 +103,98 @@ class BergmanFilter:
 
     def _key(self, subset):
         return (len(subset), tuple(self._position[x] for x in self.ground_set if x in subset))
+
+    def filter_sequence(self):
+        r"""Return the order-filter chain in Proposition 2.4.
+
+        Start with the empty filter, adding one inclusion-maximal member
+        of the remaining target filter at each step. Among those available,
+        choose a member of greatest cardinality and break ties using the
+        given ground-set order. Every term is a frozenset of frozensets.
+        """
+        sequence = [frozenset()]
+        remaining = set(self.order_filter)
+        while remaining:
+            # Greatest cardinality implies inclusion-maximality. Since
+            # larger sets have already been added, upward closure is retained.
+            z = min(remaining, key=lambda x: (-len(x), self._key(x)[1]))
+            remaining.remove(z)
+            sequence.append(sequence[-1] | frozenset((z,)))
+        return tuple(sequence)
+
+    def subdivision_sequence(self):
+        """Return the BergmanFilter object for each intermediate filter.
+
+        The original ground-set order and basepoint are preserved. Maximal
+        cones and faces can be inspected on each intermediate object.
+        """
+        return tuple(BergmanFilter(self.ground_set, p, basepoint=self.basepoint)
+                     for p in self.filter_sequence())
+
+    def fan_sequence(self):
+        """Return the corresponding sequence of Sage fans (requires Sage)."""
+        return tuple(step.sage_fan() for step in self.subdivision_sequence())
+
+    def complex_sequence(self):
+        """Return the corresponding sequence of Sage simplicial complexes."""
+        return tuple(step.sage_complex() for step in self.subdivision_sequence())
+
+    def plot_progression(self, *, columns=3, labels=True, radius=1, opacity=None):
+        """Plot the fan sequence in one figure for |E| <= 4 (requires Sage).
+
+        In 2D, returns a Sage GraphicsArray; in 3D returns a single scene
+        of spaced-out fan plots. Captions say which subset was added; adding
+        a singleton is retained and explicitly marked as a no-op. Plot order
+        is left to right and then top to bottom. The finite drawing shows
+        clipped shading and directional arrows, not bounded cones.
+        """
+        try:
+            columns = integer_index(columns)
+        except TypeError as exc:
+            raise ValueError('columns must be a positive integer') from exc
+        if columns < 1:
+            raise ValueError('columns must be a positive integer')
+        if self.dimension > 3:
+            raise ValueError('Visualization requires |E| <= 4')
+        from sage.all import Graphics, graphics_array, text
+        steps = self.subdivision_sequence()
+        captions = ['P0: empty']
+        for previous, current in zip(steps, steps[1:]):
+            z = next(iter(current.order_filter - previous.order_filter))
+            label = '{' + ', '.join(str(x) for x in self.ground_set if x in z) + '}'
+            captions.append('P%d: add %s%s' %
+                            (len(captions), label, ' (no-op)' if len(z) == 1 else ''))
+        count_cols = min(columns, len(steps))
+        if self.dimension < 3:
+            # Use the same finite window on each panel to facilitate comparison.
+            bound = 1.4 * float(radius)
+            rows = []
+            for start in range(0, len(steps), count_cols):
+                row = []
+                for i in range(start, min(start + count_cols, len(steps))):
+                    graphic = steps[i].plot_fan(labels=labels, radius=radius, opacity=opacity)
+                    graphic += text(captions[i], (0, bound + 0.30 * float(radius)),
+                                    color='black', fontsize=10)
+                    graphic.axes(False)
+                    row.append(graphic)
+                for _ in range(count_cols - len(row)):
+                    blank = Graphics()
+                    blank.axes(False)
+                    row.append(blank)
+                rows.append(row)
+            return graphics_array(rows)
+        from sage.all import text3d
+        # One scene rather than a GraphicsArray: Sage arrays support 2D only.
+        scene = None
+        spacing = 5 * float(radius)
+        for i, step in enumerate(steps):
+            graphic = step.plot_fan(labels=labels, radius=radius, opacity=opacity)
+            graphic += text3d(captions[i], (0, 0, 2.1 * float(radius)),
+                              color='black', fontsize=15)
+            graphic = graphic.translate((i % count_cols) * spacing,
+                                        -(i // count_cols) * spacing, 0)
+            scene = graphic if scene is None else scene + graphic
+        return scene
 
     def ray_coordinates(self, subset):
         r"""Coordinates of e_S in the basis (e_i : i != basepoint)."""
@@ -199,69 +315,100 @@ class BergmanFilter:
     def plot(self, kind="fan", *, labels=True, radius=1, opacity=None):
         """Create a Sage graphic of the fan or complex for |E| <= 4.
 
-        Fan cones are displayed as bounded truncations (not infinite cones).
+        Fan rays are outward-pointing arrows. Higher-dimensional cones are
+        colored, with no artificial cutoff edges drawn. A finite display
+        window is inevitable; arrows reach its boundary and indicate
+        continuation beyond the drawing. The cones themselves are unbounded.
         The complex uses the exact e_S vertices from Definition 2.2.
         ``labels`` controls ray labels; ``opacity`` is between 0 and 1.
         Return a 2D Sage Graphics object or, for |E|=4, a 3D object.
         """
         data = self.plot_data(kind, radius=radius)
         if opacity is None:
-            opacity = 0.13 if data["dimension"] == 3 else 0.18
+            opacity = 0.10 if data["dimension"] == 3 else 0.45
         try:
             opacity = float(opacity)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("opacity must be between 0 and 1") from exc
         if not 0 <= opacity <= 1:
             raise ValueError("opacity must be between 0 and 1")
-        from sage.all import Graphics, line, point, polygon, text
+        from sage.all import Graphics, arrow, line, point, polygon, text
         dim = data["dimension"]
         vertices = data["vertices"]
         origin = (0, 0, 0) if dim == 3 else (0, 0)
+        # Keep normalized ray vectors as data, but draw rays all the way to
+        # the window boundary, with arrowheads indicating continuation.
+        bound = 1.4 * float(radius)
+        ray_ends = {ray: tuple(bound * x / max(abs(t) for t in v) for x in v)
+                    for ray, v in vertices.items()} if kind == "fan" else {}
         palette = ("#4477AA", "#EE6677", "#228833", "#CCBB44",
                    "#66CCEE", "#AA3377", "#BBBBBB", "#EE7733")
         objects = []
         if dim == 3:
-            from sage.all import line3d, point3d, polygon3d, text3d
-        for i, facet in enumerate(data["facets"]):
-            pts = [vertices[v] for v in facet]
-            color = palette[i % len(palette)]
-            if dim == 3:
-                # The bounded cone is the tetrahedron conv(0, ray endpoints).
-                triangles = ([pts] + [[origin, pts[j], pts[k]]
-                             for j, k in combinations(range(len(pts)), 2)]
-                             if kind == "fan" else [pts])
+            from sage.all import arrow3d, line3d, point3d, polygon3d, text3d
+        if kind == "fan" and dim == 2:
+            # Shade the actual wedge intersected with a square viewport;
+            # do not draw the polygon's artificial outer border.
+            for i, facet in enumerate(data["facets"]):
+                a, b = [vertices[v] for v in facet]
+                region = _clip_cone_2d(a, b, 1.4 * float(radius))
+                objects.append(polygon(region, color=palette[i % len(palette)],
+                                       alpha=opacity, thickness=0))
+        if kind == "fan" and dim == 3:
+            # Translucent surface rendering of each cone's finite display
+            # section, including a cap. No polygon edges are drawn. These
+            # surfaces are a visualization, not bounded fan faces.
+            for i, facet in enumerate(data["facets"]):
+                pts = [tuple(1.4*x for x in vertices[v]) for v in facet]
+                color = palette[i % len(palette)]
+                triangles = [pts] + [[origin, pts[j], pts[k]]
+                                      for j, k in combinations(range(3), 2)]
                 for triangle in triangles:
-                    if len(triangle) == 3:
-                        objects.append(polygon3d(triangle, color=color, opacity=opacity))
-            elif dim == 2 and kind == "fan" and len(pts) == 2:
-                objects.append(polygon([origin] + pts, color=color, alpha=opacity))
-        # Draw each edge exactly once. For fan plots include radial edges.
-        for edge in self.faces(1):
-            pts = [vertices[v] for v in edge]
-            if dim == 3:
-                objects.append(line3d(pts, color="#222222", thickness=2))
-            elif dim >= 2:
-                objects.append(line(pts, color="#222222", thickness=1.5))
-        if kind == "fan":
-            for v in vertices.values():
+                    objects.append(polygon3d(triangle, color=color, opacity=opacity))
+        if kind == "complex" and dim == 3:
+            for i, facet in enumerate(data["facets"]):
+                pts = [vertices[v] for v in facet]
+                if len(pts) == 3:
+                    objects.append(polygon3d(pts, color=palette[i % len(palette)],
+                                             opacity=opacity))
+        # Cross-edges are faces of the complex, not edges of the fan.
+        if kind == "complex":
+            for edge in self.faces(1):
+                pts = [vertices[v] for v in edge]
                 if dim == 3:
-                    objects.append(line3d([origin, v], color="#555555", thickness=1))
+                    objects.append(line3d(pts, color="#222222", thickness=2))
+                elif dim >= 2:
+                    objects.append(line(pts, color="#222222", thickness=1.5))
+        else:
+            for v in ray_ends.values():
+                if dim == 3:
+                    objects.append(arrow3d(origin, v, color="#294a75"))
                 else:
-                    objects.append(line([origin, v], color="#555555", thickness=1.5))
+                    objects.append(arrow(origin, v, color="#294a75", width=1.5))
             if dim < 3:
                 objects.append(point(origin, color="black", size=22))
         for ray, v in vertices.items():
             label = "{" + ", ".join(str(x) for x in self.ground_set if x in ray) + "}"
             if dim == 3:
-                objects.append(point3d(v, color="#111111", size=14))
+                if kind == "complex":
+                    objects.append(point3d(v, color="#111111", size=14))
                 if labels:
-                    objects.append(text3d(label, tuple(1.10*x for x in v), color="black"))
+                    position = (tuple(0.86*x for x in ray_ends[ray])
+                                if kind == "fan" else tuple(1.10*x for x in v))
+                    objects.append(text3d(label, position, color="black"))
             else:
-                objects.append(point(v, color="#111111", size=35))
+                if kind == "complex":
+                    objects.append(point(v, color="#111111", size=35))
                 if labels:
-                    offset = (0, 0.09) if dim == 1 else (0.05, 0.07)
-                    objects.append(text(label, tuple(v[j] + offset[j] for j in range(2)),
-                                        color="black", fontsize=9))
+                    if kind == "fan":
+                        end = ray_ends[ray]
+                        length = (end[0]**2 + end[1]**2)**0.5
+                        offset = 0.09 * float(radius)
+                        position = (end[0] * 0.84 - offset * end[1] / length,
+                                    end[1] * 0.84 + offset * end[0] / length)
+                    else:
+                        position = (v[0] + 0.05, v[1] + 0.07)
+                    objects.append(text(label, position, color="black", fontsize=9))
         # A zero-dimensional complex consists only of the empty face; it has
         # no vertices to draw. Return an empty 2D graphic in that case.
         if not objects:
@@ -269,10 +416,12 @@ class BergmanFilter:
         graphic = objects[0]
         for obj in objects[1:]:
             graphic += obj
+        if dim < 3 and hasattr(graphic, "set_aspect_ratio"):
+            graphic.set_aspect_ratio(1)
         return graphic
 
     def plot_fan(self, **kwargs):
-        """Plot the bounded visualization of the fan; see :meth:`plot`."""
+        """Plot fan rays and colored cones; see :meth:`plot`."""
         return self.plot("fan", **kwargs)
 
     def plot_complex(self, **kwargs):
